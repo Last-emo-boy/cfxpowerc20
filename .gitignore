@@ -1,0 +1,4 @@
+# 忽略 dist 目录
+dist/
+build/
+main.spec
