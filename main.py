@@ -111,13 +111,23 @@ class Miner:
                 logging.info(f"Worker {worker_id} started mining.")
 
             if hash_value < target:
-                if self.log_level == 'light':
-                    elapsed_time = time.time() - start_time
-                    hashes_per_second = count / elapsed_time
-                    logging.info(f"Worker {worker_id}: Total {count} hashes at {hashes_per_second:.2f} hashes/sec")
-                logging.info(f"Worker {worker_id}: Nonce found - {hex(nonce)}")
-                return nonce
+                # 发现有效 nonce，处理并发送交易
+                self.handle_nonce(worker_id, nonce, start_time, count)
 
+                # 重新获取挑战值和难度，继续挖矿
+                challenge, difficulty = self.get_challenge_and_difficulty()
+                target = (2**256 - 1) >> difficulty
+                count = 0
+                start_time = time.time()
+    def handle_nonce(self, worker_id, nonce, start_time, count):
+        if self.log_level == 'light':
+            elapsed_time = time.time() - start_time
+            hashes_per_second = count / elapsed_time
+            logging.info(f"Worker {worker_id}: Total {count} hashes at {hashes_per_second:.2f} hashes/sec")
+        logging.info(f"Worker {worker_id}: Nonce found - {hex(nonce)}")
+        # 发送交易
+        tx_receipt = self.send_transaction(nonce)
+        logging.info(f"Transaction receipt: {tx_receipt}")
 
 
     def start_mining(self):
