@@ -3,12 +3,10 @@ from web3 import Account
 from web3.middleware import geth_poa_middleware
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import os, time
+import time
 import argparse
 import logging
-from eth_utils import keccak
 import random
-import sys
 
 # from tqdm import tqdm
 
@@ -100,6 +98,12 @@ class Miner:
             hash_value = int.from_bytes(data, byteorder='big')
             count += 1
 
+            if self.difficulty != difficulty:
+                # 如果难度发生变化，更新目标值
+                logging.info(f"Difficulty changed: {self.difficulty}")
+                target = self.target
+                difficulty = self.difficulty
+
             # 'verbose' 模式下的详细日志记录
             if self.log_level == 'verbose' and count % 1000 == 0:
                 elapsed_time = time.time() - start_time
@@ -134,6 +138,8 @@ class Miner:
         challenge, difficulty = self.get_challenge_and_difficulty()
         target = (2**256 - 1) >> difficulty
         self.stop_signal = False
+
+        threading.Thread(target=self.listen_for_difficulty_adjustment, daemon=True).start()
 
         try:
             with ThreadPoolExecutor(max_workers=self.worker_count) as executor:
@@ -176,6 +182,15 @@ class Miner:
         logging.info(f"From: {tx_receipt['from']}")
         return tx_receipt
 
+    def listen_for_difficulty_adjustment(self):
+        event_filter = self.contract.events.DifficultyAdjusted.createFilter(fromBlock='latest')
+        while not self.stop_signal:
+            for event in event_filter.get_new_entries():
+                new_difficulty = event['args']['newDifficulty']
+                logging.info(f"Difficulty adjusted: {new_difficulty}")
+                self.difficulty = new_difficulty
+                self.target = (2**256 - 1) >> self.difficulty
+            time.sleep(1)
 
 def main():
     parser = argparse.ArgumentParser(description="Ethereum Miner")
