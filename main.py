@@ -8,6 +8,8 @@ import argparse
 import logging
 import random
 
+
+
 # from tqdm import tqdm
 
 
@@ -51,6 +53,12 @@ contract_abi = [
     "payable": False,
     "stateMutability": "nonpayable",
     "type": "function"
+  },
+  {
+    "anonymous": False,
+    "inputs": [{"indexed": False, "internalType": "uint256", "name": "newDifficulty", "type": "uint256"}],
+    "name": "DifficultyAdjusted",
+    "type": "event"
   }
 ]
 
@@ -67,6 +75,12 @@ class Miner:
         self.worker_count = worker_count
         self.stop_signal = False  # 添加一个标志来控制线程的停止
         self.stop_event = threading.Event()  # 创建一个 Event 对象
+
+        self.difficulty = None
+        self.target = None
+        self.current_nonce = None  # 新增行：存储当前Nonce值
+        # 初始化时获取当前账户的Nonce
+        self.current_nonce = self.w3.eth.get_transaction_count(self.account.address)
 
 
         # 打印当前的难度和挑战值
@@ -87,42 +101,34 @@ class Miner:
         count = 0
         start_time = time.time()
         system_random = random.SystemRandom()
-        while not self.stop_event.is_set():
-            # nonce = os.urandom(256)
-            nonce = system_random.randint(0, 2**256 - 1)
-            # nonce_int = int.from_bytes(nonce, byteorder='big')
 
-            # 使用 keccak256 算法并按照合约中的方式组合数据
-            data = Web3.solidity_keccak(['uint256', 'address', 'uint256'], [challenge, self.account.address, nonce])
+        while not self.stop_event.is_set():
+            nonce = system_random.randint(0, 2**256 - 1)
+            data = self.prepare_data(challenge, nonce)
 
             hash_value = int.from_bytes(data, byteorder='big')
             count += 1
 
-            if self.difficulty != difficulty:
-                # 如果难度发生变化，更新目标值
-                logging.info(f"Difficulty changed: {self.difficulty}")
-                target = self.target
-                difficulty = self.difficulty
-
-            # 'verbose' 模式下的详细日志记录
-            if self.log_level == 'verbose' and count % 1000 == 0:
-                elapsed_time = time.time() - start_time
-                hashes_per_second = count / elapsed_time
-                logging.info(f"Worker {worker_id}: {hashes_per_second:.2f} hashes/sec, Current Hash: {hash_value}, Count: {count}")
-
-            # 'light' 模式下的简洁日志记录
-            elif self.log_level == 'light' and count == 1:
-                logging.info(f"Worker {worker_id} started mining.")
+            self.log_mining_info(worker_id, count, start_time, hash_value)
 
             if hash_value < target:
-                # 发现有效 nonce，处理并发送交易
                 self.handle_nonce(worker_id, nonce, start_time, count)
-
-                # 重新获取挑战值和难度，继续挖矿
                 challenge, difficulty = self.get_challenge_and_difficulty()
                 target = (2**256 - 1) >> difficulty
                 count = 0
                 start_time = time.time()
+
+    def prepare_data(self, challenge, nonce):
+        return Web3.solidity_keccak(['uint256', 'address', 'uint256'], [challenge, self.account.address, nonce])
+
+    def log_mining_info(self, worker_id, count, start_time, hash_value):
+        if self.log_level == 'verbose' and count % 1000 == 0:
+            elapsed_time = time.time() - start_time
+            hashes_per_second = count / elapsed_time
+            logging.info(f"Worker {worker_id}: {hashes_per_second:.2f} hashes/sec, Current Hash: {hash_value}, Count: {count}")
+        elif self.log_level == 'light' and count == 1:
+            logging.info(f"Worker {worker_id} started mining.")
+
     def handle_nonce(self, worker_id, nonce, start_time, count):
         if self.log_level == 'light':
             elapsed_time = time.time() - start_time
@@ -130,20 +136,23 @@ class Miner:
             logging.info(f"Worker {worker_id}: Total {count} hashes at {hashes_per_second:.2f} hashes/sec")
         logging.info(f"Worker {worker_id}: Nonce found - {hex(nonce)}")
         # 发送交易
-        tx_receipt = self.send_transaction(nonce)
-        logging.info(f"Transaction receipt: {tx_receipt}")
-
+        # 在新线程中处理 nonce 和发送交易
+        threading.Thread(target=self.send_transaction, args=(nonce,), daemon=True).start()
 
     def start_mining(self):
-        challenge, difficulty = self.get_challenge_and_difficulty()
-        target = (2**256 - 1) >> difficulty
-        self.stop_signal = False
+        # challenge, difficulty = self.get_challenge_and_difficulty()
+        # target = (2**256 - 1) >> difficulty
+        # self.stop_signal = False
 
-        threading.Thread(target=self.listen_for_difficulty_adjustment, daemon=True).start()
+        challenge, difficulty = self.get_challenge_and_difficulty()
+        self.difficulty = difficulty
+        self.target = (2**256 - 1) >> difficulty
+
+        # threading.Thread(target=self.listen_for_difficulty_adjustment, daemon=True).start()
 
         try:
             with ThreadPoolExecutor(max_workers=self.worker_count) as executor:
-                futures = [executor.submit(self.mine, i, challenge, difficulty, target) for i in range(self.worker_count)]
+                futures = [executor.submit(self.mine, i, challenge, difficulty, self.target) for i in range(self.worker_count)]
                 for future in as_completed(futures):
                     nonce = future.result()
                     tx_receipt = self.send_transaction(nonce)
@@ -153,44 +162,81 @@ class Miner:
             logging.info("Stopping mining process...")
             # 注意：不需要显式调用 executor.shutdown(wait=False)，因为 with 代码块结束时会自动调用
 
+    def get_updated_nonce(self):
+        # 同步获取当前账户的最新 nonce
+        return self.w3.eth.get_transaction_count(self.account.address)
 
     def send_transaction(self, nonce):
         # 将 nonce 从 bytes 转换为 int
         nonce_int = Web3.to_int(nonce)
+        max_attempts = 10  # 最大尝试次数，避免无限循环
 
-        # 构建事务
-        tx = self.contract.functions.mine(nonce_int).build_transaction({
-            'chainId': 71, # 主网为 1，对于测试网可能需要更改
-            'gas': 2000000,
-            'gasPrice': self.w3.to_wei('50', 'gwei'),
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
-        })
+        updated_nonce = self.get_updated_nonce()
 
-         # 签署并发送事务
-        signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.private_key)
-        tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        for attempt in range(max_attempts):
+            try:
+                # 尝试发送交易
+                # 获取更新后的账户 nonce
+                updated_nonce = self.get_updated_nonce()
 
+                # 构建事务
+                tx = self.contract.functions.mine(nonce_int).build_transaction({
+                    'chainId': 71,  # 主网为 1，对于测试网可能需要更改
+                    'gas': 2000000,
+                    'gasPrice': self.w3.to_wei('50', 'gwei'),
+                    'nonce': updated_nonce,
+                })
 
-        # 等待事务被挖掘
-        tx_receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+                # 签署并发送事务
+                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.private_key)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
 
-        # if self.log_level == 'light':
-            # logging.info(f"Transaction confirmed: {tx_receipt.transactionHash.hex()} in block {tx_receipt.blockNumber}")
-        # 输出链上信息
-        logging.info(f"Transaction Hash: {tx_receipt.transactionHash.hex()}")
-        logging.info(f"Block Number: {tx_receipt.blockNumber}")
-        logging.info(f"From: {tx_receipt['from']}")
-        return tx_receipt
+                # 等待事务被挖掘
+                tx_receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
 
-    def listen_for_difficulty_adjustment(self):
-        event_filter = self.contract.events.DifficultyAdjusted.createFilter(fromBlock='latest')
-        while not self.stop_signal:
-            for event in event_filter.get_new_entries():
-                new_difficulty = event['args']['newDifficulty']
-                logging.info(f"Difficulty adjusted: {new_difficulty}")
-                self.difficulty = new_difficulty
-                self.target = (2**256 - 1) >> self.difficulty
-            time.sleep(1)
+                # 输出链上信息
+                logging.info(f"Transaction Hash: {tx_receipt.transactionHash.hex()}")
+                logging.info(f"Block Number: {tx_receipt.blockNumber}")
+                logging.info(f"From: {tx_receipt['from']}")
+
+                # 检查难度是否发生变化
+                current_challenge = self.contract.functions.challenge().call()
+                current_difficulty = self.contract.functions.difficulty().call()
+                if current_difficulty != self.difficulty:
+                    logging.info(f"Difficulty adjusted: {current_difficulty}")
+                    logging.info(f"Current Challenge: {current_challenge}")
+                    self.difficulty = current_difficulty
+                    self.target = (2**256 - 1) >> self.difficulty
+
+                return tx_receipt
+            except ValueError as e:
+                error_message = str(e)
+                if "nonce" in error_message and "stale" in error_message:
+                    logging.warning(f"Stale nonce detected on attempt {attempt + 1}, retrying with updated nonce...")
+                    continue
+                elif "nonce" in error_message and "already inserted" in error_message:
+                    logging.warning(f"Nonce conflict detected on attempt {attempt + 1}, retrying with incremented nonce...")
+                    self.current_nonce += 1
+                    continue
+                else:
+                    raise e
+        logging.error(f"Failed to send transaction after {max_attempts} attempts due to nonce issues.")
+        return None
+    # def listen_for_difficulty_adjustment(self):
+        # event_filter = self.contract.events.DifficultyAdjusted.create_filter(fromBlock='latest')
+        # while not self.stop_signal:
+            # for event in event_filter.get_new_entries():
+                # new_difficulty = event['args']['newDifficulty']
+                # logging.info(f"Difficulty adjusted: {new_difficulty}")
+                # self.difficulty = new_difficulty
+                # self.target = (2**256 - 1) >> self.difficulty
+            # time.sleep(1)
+    def check_difficulty_adjustment(self):
+        current_difficulty = self.contract.functions.difficulty().call()
+        if current_difficulty != self.difficulty:
+            logging.info(f"Difficulty adjusted: {current_difficulty}")
+            self.difficulty = current_difficulty
+            self.target = (2**256 - 1) >> self.difficulty
 
 def main():
     parser = argparse.ArgumentParser(description="Ethereum Miner")
