@@ -1,5 +1,4 @@
-from web3 import Web3
-from web3 import Account
+from web3 import Web3, Account
 from web3.middleware import geth_poa_middleware
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
